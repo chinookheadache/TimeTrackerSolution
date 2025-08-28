@@ -1,22 +1,54 @@
-<!-- ScreenshotClient/MainWindow.xaml (minimal timeline snippet; merge into your layout) -->
+<?xml version="1.0" encoding="utf-8"?>
 <Window x:Class="ScreenshotClient.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="TimeTracker" Height="600" Width="900">
-    <DockPanel>
-        <ScrollViewer VerticalScrollBarVisibility="Auto">
-            <ItemsControl ItemsSource="{Binding Screenshots}">
-                <ItemsControl.ItemTemplate>
-                    <DataTemplate>
-                        <Border Margin="6" Padding="6" BorderBrush="#DDD" BorderThickness="1">
-                            <StackPanel>
-                                <TextBlock Text="{Binding Path}" FontSize="12"/>
-                                <Image Source="{Binding Thumbnail}" Height="180" Stretch="Uniform" Margin="0,4,0,0"/>
-                            </StackPanel>
-                        </Border>
-                    </DataTemplate>
-                </ItemsControl.ItemTemplate>
-            </ItemsControl>
-        </ScrollViewer>
-    </DockPanel>
+        Title="PVI Time Tracker" Height="600" Width="900"
+        Background="#1E1E1E" Foreground="White">
+
+    <Grid>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="250"/>
+            <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+
+        <!-- Sidebar controls (original style) -->
+        <StackPanel Grid.Column="0" Margin="10" Background="#2D2D30">
+            <TextBlock Text="Settings" FontSize="20" Margin="0,0,0,20" />
+
+            <TextBlock Text="Screenshot Interval (seconds):"/>
+            <TextBox Name="IntervalBox" Text="30" Margin="0,5,0,15" IsEnabled="False"/>
+
+            <TextBlock Text="JPEG Quality (%):"/>
+            <TextBox Name="QualityBox" Text="70" Margin="0,5,0,15" IsEnabled="False"/>
+
+            <!-- Start button text will be updated dynamically in code-behind -->
+            <Button Content="Service is Stopped" Name="StartBtn" Margin="0,5,0,5" Height="30"
+                    Background="LightGray" Foreground="Black"
+                    BorderBrush="Black" BorderThickness="1"
+                    IsEnabled="False"/>
+
+            <Button Content="Pause Capture" Name="PauseBtn" Margin="0,5,0,5" Height="30"
+                    Background="Red" Foreground="White"
+                    BorderBrush="Black" BorderThickness="1"
+                    IsEnabled="False"/>
+
+            <Button Content="Select Folder" Name="FolderBtn" Margin="0,20,0,5" Height="30"
+                    BorderBrush="Black" BorderThickness="1"
+                    IsEnabled="False"/>
+
+            <TextBlock Text="Select Day:" Margin="0,20,0,5"/>
+            <ComboBox Name="DaySelector" Margin="0,5,0,15"/>
+        </StackPanel>
+
+        <!-- Viewer area (original layout) -->
+        <Grid Grid.Column="1" Margin="10">
+            <Border Background="Black" CornerRadius="8" Padding="10">
+                <Grid>
+                    <Image Name="ScreenshotView" Stretch="Uniform" />
+                    <Slider Name="TimelineSlider" Minimum="0" Maximum="100" Height="20"
+                            VerticalAlignment="Bottom" HorizontalAlignment="Center"/>
+                </Grid>
+            </Border>
+        </Grid>
+    </Grid>
 </Window>

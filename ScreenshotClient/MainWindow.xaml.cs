@@ -1,11 +1,10 @@
-// ScreenshotClient/MainWindow.xaml.cs
 using System;
-using System.Collections.ObjectModel;
-using System.ComponentModel;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using ScreenshotShared.Messaging;
 using ScreenshotShared.Settings;
@@ -14,136 +13,263 @@ namespace ScreenshotClient
 {
     public partial class MainWindow : Window
     {
-        private readonly PipeClient _client = new("ScreenshotPipe");
+        private readonly PipeClient _pipeClient = new("ScreenshotPipe");
         private readonly CancellationTokenSource _cts = new();
 
-        public MainViewModel VM { get; } = new();
+        private string _baseFolder = "";
+        private bool _isCapturing = false;
 
         public MainWindow()
         {
             InitializeComponent();
-            DataContext = VM;
 
-            Loaded += async (_, __) => { await TryConnectPipe(); };
-            Unloaded += async (_, __) => { _cts.Cancel(); await _client.DisposeAsync(); };
-        }
+            // Disable controls until pipe connects; default visuals
+            SetControlsEnabled(false);
+            UpdateServiceVisuals(isCapturing: false);
 
-        private async Task TryConnectPipe()
-        {
-            try
-            {
-                await _client.ConnectAsync(TimeSpan.FromSeconds(3), _cts.Token);
-                _client.MessageReceived += OnMessage;
-                _client.ReceiveFaulted += ex => { /* optional log */ };
-            }
-            catch
-            {
-                System.Windows.MessageBox.Show("Unable to connect to Tracker. Please start the Tracker process.");
-            }
-        }
+            // Hook UI events
+            StartBtn.Click += async (_, __) => await SendCommandAsync("StartCapture");
+            PauseBtn.Click += async (_, __) => await SendCommandAsync("StopCapture");
+            FolderBtn.Click += FolderBtn_Click;
 
-        private void OnMessage(PipeMessage msg)
-        {
-            Dispatcher.Invoke(() =>
+            IntervalBox.TextChanged += async (_, __) =>
             {
-                switch (msg.Event)
+                if (!_pipeClient.IsConnected) return;
+                if (int.TryParse(IntervalBox.Text, out var s) && s > 0)
+                    await SendCommandAsync("SetInterval", value: s.ToString());
+            };
+
+            QualityBox.TextChanged += async (_, __) =>
+            {
+                if (!_pipeClient.IsConnected) return;
+                if (int.TryParse(QualityBox.Text, out var q) && q is >= 1 and <= 100)
+                    await SendCommandAsync("SetQuality", value: q.ToString());
+            };
+
+            // Pipe wiring
+            _pipeClient.MessageReceived += OnPipeMessageReceived;
+            _pipeClient.ReceiveFaulted += ex =>
+            {
+                Dispatcher.Invoke(() =>
                 {
-                    case "CaptureStarted":
-                        VM.IsCapturing = true;
-                        break;
-                    case "CaptureStopped":
-                        VM.IsCapturing = false;
-                        break;
-                    case "ScreenshotSaved":
-                        if (!string.IsNullOrWhiteSpace(msg.Path))
-                            VM.AddScreenshot(msg.Path!);
-                        break;
-                    case "SettingsSync":
-                        if (!string.IsNullOrEmpty(msg.Value))
+                    SetControlsEnabled(false);
+                    UpdateServiceVisuals(isCapturing: false);
+                });
+            };
+
+            Loaded += async (_, __) =>
+            {
+                // 1) Load last-used settings locally so UI isn't blank
+                var settings = AppSettings.Load();
+                _baseFolder = settings.BaseFolder;
+                IntervalBox.Text = settings.IntervalSeconds.ToString();
+                QualityBox.Text = settings.JpegQuality.ToString();
+                RefreshDaySelector();
+
+                // 2) Connect to tracker and sync current state (if tracker running)
+                try
+                {
+                    await _pipeClient.ConnectAsync(TimeSpan.FromSeconds(3), _cts.Token);
+                    if (_pipeClient.IsConnected)
+                    {
+                        SetControlsEnabled(true);
+
+                        // Ask tracker to reply with Settings + State
+                        await _pipeClient.SendAsync(PipeMessage.Cmd("QueryState"), _cts.Token);
+
+                        // Tell tracker our folder (if valid)
+                        if (Directory.Exists(_baseFolder))
                         {
-                            var parts = msg.Value.Split(';');
-                            if (parts.Length == 2 &&
-                                int.TryParse(parts[0], out var i) &&
-                                int.TryParse(parts[1], out var q))
-                            {
-                                VM.IntervalSeconds = i;
-                                VM.JpegQuality = q;
-                            }
+                            await _pipeClient.SendAsync(new PipeMessage { Command = "SetFolder", Path = _baseFolder }, _cts.Token);
                         }
-                        if (!string.IsNullOrWhiteSpace(msg.Path))
-                            VM.BaseFolder = msg.Path!;
-                        break;
+                    }
+                    else
+                    {
+                        System.Windows.MessageBox.Show("Failed to connect to ScreenshotTracker.");
+                    }
                 }
-            });
+                catch (Exception ex)
+                {
+                    System.Windows.MessageBox.Show($"Pipe connection failed: {ex.Message}");
+                }
+            };
+
+            Unloaded += async (_, __) =>
+            {
+                try { _cts.Cancel(); } catch { }
+                await _pipeClient.DisposeAsync();
+            };
         }
 
-        // Wire these handlers to your existing buttons in XAML:
-        private async void Start_Click(object sender, RoutedEventArgs e) =>
-            await _client.SendAsync(PipeMessage.Cmd("StartCapture"), _cts.Token);
+        private async Task SendCommandAsync(string command, string? value = null, string? path = null)
+        {
+            if (!_pipeClient.IsConnected)
+            {
+                System.Windows.MessageBox.Show("Not connected to the tracker yet.");
+                return;
+            }
+            await _pipeClient.SendAsync(new PipeMessage { Command = command, Value = value, Path = path }, _cts.Token);
+        }
 
-        private async void Stop_Click(object sender, RoutedEventArgs e) =>
-            await _client.SendAsync(PipeMessage.Cmd("StopCapture"), _cts.Token);
-
-        private async void Folder_Click(object sender, RoutedEventArgs e)
+        private async void FolderBtn_Click(object? sender, RoutedEventArgs e)
         {
             var dlg = new System.Windows.Forms.FolderBrowserDialog();
             var result = dlg.ShowDialog();
             if (result == System.Windows.Forms.DialogResult.OK && Directory.Exists(dlg.SelectedPath))
             {
-                VM.BaseFolder = dlg.SelectedPath;
-                await _client.SendAsync(new PipeMessage { Command = "SetFolder", Path = dlg.SelectedPath }, _cts.Token);
+                _baseFolder = dlg.SelectedPath;
+
+                // Persist locally (shared settings)
+                var s = AppSettings.Load();
+                s.BaseFolder = _baseFolder;
+                Directory.CreateDirectory(s.BaseFolder);
+                s.Save();
+
+                RefreshDaySelector();
+
+                // Notify tracker
+                if (_pipeClient.IsConnected)
+                    await _pipeClient.SendAsync(new PipeMessage { Command = "SetFolder", Path = _baseFolder }, _cts.Token);
             }
         }
-    }
 
-    public sealed class MainViewModel : INotifyPropertyChanged
-    {
-        private readonly AppSettings _initial = AppSettings.Load();
-
-        private string _baseFolder;
-        private int _intervalSeconds;
-        private int _jpegQuality;
-        private bool _isCapturing;
-
-        public MainViewModel()
+        private void OnPipeMessageReceived(PipeMessage msg)
         {
-            _baseFolder = _initial.BaseFolder;
-            _intervalSeconds = _initial.IntervalSeconds;
-            _jpegQuality = _initial.JpegQuality;
+            Dispatcher.Invoke(() =>
+            {
+                switch (msg.Event)
+                {
+                    case "SettingsSync":
+                        // Value: "interval;jpeg", Path: BaseFolder
+                        if (!string.IsNullOrEmpty(msg.Value))
+                        {
+                            var parts = msg.Value.Split(';');
+                            if (parts.Length == 2
+                                && int.TryParse(parts[0], out var i)
+                                && int.TryParse(parts[1], out var q))
+                            {
+                                IntervalBox.Text = i.ToString();
+                                QualityBox.Text = q.ToString();
+                            }
+                        }
+                        if (!string.IsNullOrWhiteSpace(msg.Path))
+                        {
+                            _baseFolder = msg.Path!;
+                            RefreshDaySelector();
+                        }
+                        break;
+
+                    case "CaptureStarted":
+                        _isCapturing = true;
+                        UpdateServiceVisuals(true);
+                        break;
+
+                    case "CaptureStopped":
+                        _isCapturing = false;
+                        UpdateServiceVisuals(false);
+                        break;
+
+                    case "CaptureState":
+                        // Value: "Running" | "Stopped"
+                        _isCapturing = string.Equals(msg.Value, "Running", StringComparison.OrdinalIgnoreCase);
+                        UpdateServiceVisuals(_isCapturing);
+                        break;
+
+                    case "ScreenshotSaved":
+                        if (!string.IsNullOrWhiteSpace(msg.Path))
+                        {
+                            LoadImageToViewer(msg.Path!);
+                            EnsureDayInSelector(Path.GetDirectoryName(msg.Path!) ?? "");
+                        }
+                        break;
+                }
+            });
         }
 
-        public ObservableCollection<ScreenshotItem> Screenshots { get; } = new();
-
-        public string BaseFolder { get => _baseFolder; set { _baseFolder = value; OnPropertyChanged(nameof(BaseFolder)); } }
-        public int IntervalSeconds { get => _intervalSeconds; set { _intervalSeconds = value; OnPropertyChanged(nameof(IntervalSeconds)); } }
-        public int JpegQuality { get => _jpegQuality; set { _jpegQuality = value; OnPropertyChanged(nameof(JpegQuality)); } }
-        public bool IsCapturing { get => _isCapturing; set { _isCapturing = value; OnPropertyChanged(nameof(IsCapturing)); } }
-
-        public event PropertyChangedEventHandler? PropertyChanged;
-        private void OnPropertyChanged(string name) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
-
-        public void AddScreenshot(string path)
+        private void SetControlsEnabled(bool enabled)
         {
-            Screenshots.Insert(0, new ScreenshotItem { Path = path, Thumbnail = LoadThumb(path) });
+            StartBtn.IsEnabled = enabled;
+            PauseBtn.IsEnabled = enabled;
+            FolderBtn.IsEnabled = enabled;
+            IntervalBox.IsEnabled = enabled;
+            QualityBox.IsEnabled = enabled;
         }
 
-        private static BitmapImage LoadThumb(string path)
+        /// <summary>
+        /// Updates Start/Pause button look AND Start button text to:
+        /// "Service is Running" / "Service is Stopped"
+        /// </summary>
+        private void UpdateServiceVisuals(bool isCapturing)
         {
-            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-            var bmp = new BitmapImage();
-            bmp.BeginInit();
-            bmp.CacheOption = BitmapCacheOption.OnLoad;
-            bmp.DecodePixelWidth = 480;
-            bmp.StreamSource = fs;
-            bmp.EndInit();
-            bmp.Freeze();
-            return bmp;
-        }
-    }
+            if (isCapturing)
+            {
+                StartBtn.Content = "Service is Running";
+                StartBtn.Background = System.Windows.Media.Brushes.Green;
+                StartBtn.Foreground = System.Windows.Media.Brushes.White;
 
-    public sealed class ScreenshotItem
-    {
-        public string Path { get; set; } = "";
-        public BitmapImage? Thumbnail { get; set; }
+                PauseBtn.Background = System.Windows.Media.Brushes.LightGray;
+                PauseBtn.Foreground = System.Windows.Media.Brushes.Black;
+            }
+            else
+            {
+                StartBtn.Content = "Service is Stopped";
+                StartBtn.Background = System.Windows.Media.Brushes.LightGray;
+                StartBtn.Foreground = System.Windows.Media.Brushes.Black;
+
+                PauseBtn.Background = System.Windows.Media.Brushes.Red;
+                PauseBtn.Foreground = System.Windows.Media.Brushes.White;
+            }
+        }
+
+        private void RefreshDaySelector()
+        {
+            try
+            {
+                DaySelector.Items.Clear();
+                if (!Directory.Exists(_baseFolder)) return;
+
+                var days = Directory.EnumerateDirectories(_baseFolder)
+                                    .Select(Path.GetFileName)
+                                    .Where(d => !string.IsNullOrWhiteSpace(d))
+                                    .OrderByDescending(d => d)
+                                    .ToList();
+
+                foreach (var d in days) DaySelector.Items.Add(d);
+                if (DaySelector.Items.Count > 0) DaySelector.SelectedIndex = 0;
+            }
+            catch { /* ignore */ }
+        }
+
+        private void EnsureDayInSelector(string dayFolder)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(dayFolder)) return;
+                var day = Path.GetFileName(dayFolder);
+                if (string.IsNullOrWhiteSpace(day)) return;
+
+                if (!DaySelector.Items.OfType<string>().Contains(day))
+                {
+                    DaySelector.Items.Insert(0, day);
+                }
+            }
+            catch { }
+        }
+
+        private void LoadImageToViewer(string path)
+        {
+            try
+            {
+                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                var bmp = new BitmapImage();
+                bmp.BeginInit();
+                bmp.CacheOption = BitmapCacheOption.OnLoad;
+                bmp.StreamSource = fs;
+                bmp.EndInit();
+                bmp.Freeze();
+                ScreenshotView.Source = bmp;
+            }
+            catch { /* ignore display errors for now */ }
+        }
     }
 }

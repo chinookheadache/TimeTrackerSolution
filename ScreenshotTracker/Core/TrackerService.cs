@@ -22,6 +22,11 @@ namespace ScreenshotTracker.Core
 
             _server = new PipeServer("ScreenshotPipe");
             _server.MessageReceived += OnMessageReceived;
+            _server.ClientConnected += async id =>
+            {
+                // As soon as a client connects, push current settings & running state to THAT client
+                try { await SendStateAsync(id); } catch { /* optional log */ }
+            };
             _server.Start();
 
             _collector = new ScreenshotCollector(
@@ -32,7 +37,7 @@ namespace ScreenshotTracker.Core
             _collector.ScreenshotSaved += async (_, path) =>
             {
                 try { await _server.BroadcastAsync(PipeMessage.Ev("ScreenshotSaved", path: path), _cts.Token); }
-                catch { }
+                catch { /* optional log */ }
             };
         }
 
@@ -78,6 +83,11 @@ namespace ScreenshotTracker.Core
                         }
                         break;
 
+                    case "QueryState":
+                        // Client explicitly asked for current settings + running state
+                        await SendStateAsync(clientId);
+                        break;
+
                     case "Shutdown":
                         await _server.BroadcastAsync(PipeMessage.Ev("TrackerExiting"), _cts.Token);
                         await DisposeAsync();
@@ -85,7 +95,10 @@ namespace ScreenshotTracker.Core
                         break;
                 }
             }
-            catch { }
+            catch
+            {
+                // optional logging
+            }
         }
 
         private Task BroadcastSettingsSync() =>
@@ -96,6 +109,31 @@ namespace ScreenshotTracker.Core
                 Path = _settings.BaseFolder
             }, _cts.Token);
 
+        /// <summary>
+        /// Send SettingsSync + CaptureState either to a specific client (if id provided) or broadcast to all.
+        /// </summary>
+        private async Task SendStateAsync(int? clientId = null)
+        {
+            var settings = new PipeMessage
+            {
+                Event = "SettingsSync",
+                Value = $"{_settings.IntervalSeconds};{_settings.JpegQuality}",
+                Path = _settings.BaseFolder
+            };
+            var state = PipeMessage.Ev("CaptureState", value: _collector.IsRunning ? "Running" : "Stopped");
+
+            if (clientId is int id)
+            {
+                await _server.SendAsync(id, settings, _cts.Token);
+                await _server.SendAsync(id, state, _cts.Token);
+            }
+            else
+            {
+                await _server.BroadcastAsync(settings, _cts.Token);
+                await _server.BroadcastAsync(state, _cts.Token);
+            }
+        }
+
         public async ValueTask DisposeAsync()
         {
             try
@@ -104,7 +142,10 @@ namespace ScreenshotTracker.Core
                 _collector.Stop();
                 await _server.DisposeAsync();
             }
-            catch { }
+            catch
+            {
+                // ignore
+            }
         }
     }
 }
