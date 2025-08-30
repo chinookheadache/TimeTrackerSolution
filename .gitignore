@@ -31,6 +31,8 @@ Thumbs.db
 # Local artifacts
 Screenshots/
 settings.local.json
+artifacts/
+Build-Reference.ps1
 
 # Coverage & logs
 coverage/
