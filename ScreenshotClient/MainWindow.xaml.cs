@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -19,15 +19,18 @@ namespace ScreenshotClient
         private string _baseFolder = "";
         private bool _isCapturing = false;
 
+        private FileSystemWatcher? _watcher;
+        private string _currentDayFolder = "";
+
         public MainWindow()
         {
             InitializeComponent();
 
-            // Disable controls until pipe connects; default visuals
+            // Disable controls until pipe connects
             SetControlsEnabled(false);
             UpdateServiceVisuals(isCapturing: false);
 
-            // Hook UI events
+            // UI events
             StartBtn.Click += async (_, __) => await SendCommandAsync("StartCapture");
             PauseBtn.Click += async (_, __) => await SendCommandAsync("StopCapture");
             FolderBtn.Click += FolderBtn_Click;
@@ -46,7 +49,7 @@ namespace ScreenshotClient
                     await SendCommandAsync("SetQuality", value: q.ToString());
             };
 
-            // Pipe wiring
+            // Pipe events
             _pipeClient.MessageReceived += OnPipeMessageReceived;
             _pipeClient.ReceiveFaulted += ex =>
             {
@@ -57,27 +60,29 @@ namespace ScreenshotClient
                 });
             };
 
+            // On load, connect and setup
             Loaded += async (_, __) =>
             {
-                // 1) Load last-used settings locally so UI isn't blank
                 var settings = AppSettings.Load();
                 _baseFolder = settings.BaseFolder;
                 IntervalBox.Text = settings.IntervalSeconds.ToString();
                 QualityBox.Text = settings.JpegQuality.ToString();
                 RefreshDaySelector();
+                SetupWatcherForToday();
 
-                // 2) Connect to tracker and sync current state (if tracker running)
                 try
                 {
+                    // Await the connect call
                     await _pipeClient.ConnectAsync(TimeSpan.FromSeconds(3), _cts.Token);
+
                     if (_pipeClient.IsConnected)
                     {
                         SetControlsEnabled(true);
 
-                        // Ask tracker to reply with Settings + State
-                        await _pipeClient.SendAsync(PipeMessage.Cmd("QueryState"), _cts.Token);
+                        // Ask tracker for its current settings/state
+                        await _pipeClient.SendAsync(new PipeMessage { Command = "QueryState" }, _cts.Token);
 
-                        // Tell tracker our folder (if valid)
+                        // Tell tracker our folder if valid
                         if (Directory.Exists(_baseFolder))
                         {
                             await _pipeClient.SendAsync(new PipeMessage { Command = "SetFolder", Path = _baseFolder }, _cts.Token);
@@ -96,8 +101,22 @@ namespace ScreenshotClient
 
             Unloaded += async (_, __) =>
             {
-                try { _cts.Cancel(); } catch { }
+                try { _cts.Cancel(); } catch { /* ignore */ }
+                // Await the async dispose (fixes ValueTask warning)
                 await _pipeClient.DisposeAsync();
+            };
+
+            // Day selector change → load newest image & watch folder
+            DaySelector.SelectionChanged += (_, __) =>
+            {
+                try
+                {
+                    if (DaySelector.SelectedItem is not string day) return;
+                    var dayPath = Path.Combine(_baseFolder, day);
+                    LoadMostRecentIn(dayPath);
+                    SetupWatcherForSelectedDay();
+                }
+                catch { }
             };
         }
 
@@ -108,6 +127,7 @@ namespace ScreenshotClient
                 System.Windows.MessageBox.Show("Not connected to the tracker yet.");
                 return;
             }
+            // Always await SendAsync (fixes ValueTask warning)
             await _pipeClient.SendAsync(new PipeMessage { Command = command, Value = value, Path = path }, _cts.Token);
         }
 
@@ -119,15 +139,13 @@ namespace ScreenshotClient
             {
                 _baseFolder = dlg.SelectedPath;
 
-                // Persist locally (shared settings)
                 var s = AppSettings.Load();
                 s.BaseFolder = _baseFolder;
-                Directory.CreateDirectory(s.BaseFolder);
                 s.Save();
 
                 RefreshDaySelector();
+                SetupWatcherForToday();
 
-                // Notify tracker
                 if (_pipeClient.IsConnected)
                     await _pipeClient.SendAsync(new PipeMessage { Command = "SetFolder", Path = _baseFolder }, _cts.Token);
             }
@@ -156,6 +174,7 @@ namespace ScreenshotClient
                         {
                             _baseFolder = msg.Path!;
                             RefreshDaySelector();
+                            SetupWatcherForToday();
                         }
                         break;
 
@@ -170,7 +189,6 @@ namespace ScreenshotClient
                         break;
 
                     case "CaptureState":
-                        // Value: "Running" | "Stopped"
                         _isCapturing = string.Equals(msg.Value, "Running", StringComparison.OrdinalIgnoreCase);
                         UpdateServiceVisuals(_isCapturing);
                         break;
@@ -206,7 +224,6 @@ namespace ScreenshotClient
                 StartBtn.Content = "Service is Running";
                 StartBtn.Background = System.Windows.Media.Brushes.Green;
                 StartBtn.Foreground = System.Windows.Media.Brushes.White;
-
                 PauseBtn.Background = System.Windows.Media.Brushes.LightGray;
                 PauseBtn.Foreground = System.Windows.Media.Brushes.Black;
             }
@@ -215,7 +232,6 @@ namespace ScreenshotClient
                 StartBtn.Content = "Service is Stopped";
                 StartBtn.Background = System.Windows.Media.Brushes.LightGray;
                 StartBtn.Foreground = System.Windows.Media.Brushes.Black;
-
                 PauseBtn.Background = System.Windows.Media.Brushes.Red;
                 PauseBtn.Foreground = System.Windows.Media.Brushes.White;
             }
@@ -270,6 +286,79 @@ namespace ScreenshotClient
                 ScreenshotView.Source = bmp;
             }
             catch { /* ignore display errors for now */ }
+        }
+
+        // === New helpers for watchers ===
+        private void SetupWatcherForToday()
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(_baseFolder)) return;
+                var today = DateTime.Now.ToString("yyyy-MM-dd");
+                var dayPath = Path.Combine(_baseFolder, today);
+                Directory.CreateDirectory(dayPath);
+
+                if (string.Equals(_currentDayFolder, dayPath, StringComparison.OrdinalIgnoreCase))
+                    return;
+
+                _watcher?.Dispose();
+                _watcher = new FileSystemWatcher(dayPath, "*.jpg")
+                {
+                    NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.CreationTime,
+                    IncludeSubdirectories = false,
+                    EnableRaisingEvents = true
+                };
+                _watcher.Created += (_, e) => Dispatcher.Invoke(() =>
+                {
+                    LoadImageToViewer(e.FullPath);
+                    EnsureDayInSelector(dayPath);
+                });
+
+                _currentDayFolder = dayPath;
+            }
+            catch { }
+        }
+
+        private void SetupWatcherForSelectedDay()
+        {
+            try
+            {
+                _watcher?.Dispose();
+                _watcher = null;
+
+                if (string.IsNullOrWhiteSpace(_baseFolder)) return;
+                if (DaySelector.SelectedItem is not string dayName) return;
+
+                var dayPath = Path.Combine(_baseFolder, dayName);
+                if (!Directory.Exists(dayPath)) return;
+
+                _watcher = new FileSystemWatcher(dayPath, "*.jpg")
+                {
+                    NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.CreationTime,
+                    IncludeSubdirectories = false,
+                    EnableRaisingEvents = true
+                };
+                _watcher.Created += (_, e) => Dispatcher.Invoke(() =>
+                {
+                    LoadImageToViewer(e.FullPath);
+                });
+
+                _currentDayFolder = dayPath;
+            }
+            catch { }
+        }
+
+        private void LoadMostRecentIn(string dayPath)
+        {
+            try
+            {
+                if (!Directory.Exists(dayPath)) return;
+                var latest = Directory.EnumerateFiles(dayPath, "*.jpg")
+                                      .OrderByDescending(File.GetCreationTimeUtc)
+                                      .FirstOrDefault();
+                if (latest != null) LoadImageToViewer(latest);
+            }
+            catch { }
         }
     }
 }
