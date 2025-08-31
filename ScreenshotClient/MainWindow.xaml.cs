@@ -28,11 +28,18 @@ namespace ScreenshotClient
 
             // Disable controls until pipe connects
             SetControlsEnabled(false);
-            UpdateServiceVisuals(isCapturing: false);
+            UpdateServiceVisuals(isCapturing: false); // sets status pill + toggle text
 
             // UI events
-            StartBtn.Click += async (_, __) => await SendCommandAsync("StartCapture");
-            PauseBtn.Click += async (_, __) => await SendCommandAsync("StopCapture");
+            // Top "StartBtn" is status-only: no Click handler
+            PauseBtn.Click += async (_, __) =>
+            {
+                if (_isCapturing)
+                    await SendCommandAsync("StopCapture");
+                else
+                    await SendCommandAsync("StartCapture");
+            };
+
             FolderBtn.Click += FolderBtn_Click;
 
             IntervalBox.TextChanged += async (_, __) =>
@@ -72,14 +79,12 @@ namespace ScreenshotClient
 
                 try
                 {
-                    // Await the connect call
                     await _pipeClient.ConnectAsync(TimeSpan.FromSeconds(3), _cts.Token);
-
                     if (_pipeClient.IsConnected)
                     {
                         SetControlsEnabled(true);
 
-                        // Ask tracker for its current settings/state
+                        // Ask tracker for current settings/state
                         await _pipeClient.SendAsync(new PipeMessage { Command = "QueryState" }, _cts.Token);
 
                         // Tell tracker our folder if valid
@@ -102,7 +107,6 @@ namespace ScreenshotClient
             Unloaded += async (_, __) =>
             {
                 try { _cts.Cancel(); } catch { /* ignore */ }
-                // Await the async dispose (fixes ValueTask warning)
                 await _pipeClient.DisposeAsync();
             };
 
@@ -127,7 +131,6 @@ namespace ScreenshotClient
                 System.Windows.MessageBox.Show("Not connected to the tracker yet.");
                 return;
             }
-            // Always await SendAsync (fixes ValueTask warning)
             await _pipeClient.SendAsync(new PipeMessage { Command = command, Value = value, Path = path }, _cts.Token);
         }
 
@@ -189,6 +192,7 @@ namespace ScreenshotClient
                         break;
 
                     case "CaptureState":
+                        // "Running" | "Stopped"
                         _isCapturing = string.Equals(msg.Value, "Running", StringComparison.OrdinalIgnoreCase);
                         UpdateServiceVisuals(_isCapturing);
                         break;
@@ -206,7 +210,9 @@ namespace ScreenshotClient
 
         private void SetControlsEnabled(bool enabled)
         {
-            StartBtn.IsEnabled = enabled;
+            // Status "button" stays enabled so colors show; it's non-clickable via IsHitTestVisible.
+            // StartBtn.IsEnabled = true; // not needed, but fine if you want to set explicitly
+
             PauseBtn.IsEnabled = enabled;
             FolderBtn.IsEnabled = enabled;
             IntervalBox.IsEnabled = enabled;
@@ -214,26 +220,35 @@ namespace ScreenshotClient
         }
 
         /// <summary>
-        /// Updates Start/Pause button look AND Start button text to:
-        /// "Service is Running" / "Service is Stopped"
+        /// Top display shows status (green/red). Bottom toggle shows Start/Stop label.
         /// </summary>
         private void UpdateServiceVisuals(bool isCapturing)
         {
+            _isCapturing = isCapturing;
+
             if (isCapturing)
             {
+                // Status display
                 StartBtn.Content = "Service is Running";
                 StartBtn.Background = System.Windows.Media.Brushes.Green;
                 StartBtn.Foreground = System.Windows.Media.Brushes.White;
+
+                // Toggle label
+                PauseBtn.Content = "Stop service";
                 PauseBtn.Background = System.Windows.Media.Brushes.LightGray;
                 PauseBtn.Foreground = System.Windows.Media.Brushes.Black;
             }
             else
             {
+                // Status display
                 StartBtn.Content = "Service is Stopped";
-                StartBtn.Background = System.Windows.Media.Brushes.LightGray;
-                StartBtn.Foreground = System.Windows.Media.Brushes.Black;
-                PauseBtn.Background = System.Windows.Media.Brushes.Red;
-                PauseBtn.Foreground = System.Windows.Media.Brushes.White;
+                StartBtn.Background = System.Windows.Media.Brushes.Red;
+                StartBtn.Foreground = System.Windows.Media.Brushes.White;
+
+                // Toggle label
+                PauseBtn.Content = "Start service";
+                PauseBtn.Background = System.Windows.Media.Brushes.LightGray;
+                PauseBtn.Foreground = System.Windows.Media.Brushes.Black;
             }
         }
 
@@ -288,7 +303,7 @@ namespace ScreenshotClient
             catch { /* ignore display errors for now */ }
         }
 
-        // === New helpers for watchers ===
+        // === Watchers ===
         private void SetupWatcherForToday()
         {
             try
