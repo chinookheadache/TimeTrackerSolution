@@ -7,7 +7,6 @@ using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using ScreenshotShared.Messaging;
-using ScreenshotShared.Settings;
 
 namespace ScreenshotClient
 {
@@ -28,10 +27,9 @@ namespace ScreenshotClient
 
             // Disable controls until pipe connects
             SetControlsEnabled(false);
-            UpdateServiceVisuals(isCapturing: false); // sets status pill + toggle text
+            UpdateServiceVisuals(isCapturing: false);
 
-            // UI events
-            // Top "StartBtn" is status-only: no Click handler
+            // TOP is status-only (non-clickable); BOTTOM is the toggle
             PauseBtn.Click += async (_, __) =>
             {
                 if (_isCapturing)
@@ -60,57 +58,45 @@ namespace ScreenshotClient
             _pipeClient.MessageReceived += OnPipeMessageReceived;
             _pipeClient.ReceiveFaulted += ex =>
             {
+                // Server disappeared or pipe broke: close cleanly
                 Dispatcher.Invoke(() =>
                 {
-                    SetControlsEnabled(false);
-                    UpdateServiceVisuals(isCapturing: false);
+                    System.Windows.Application.Current.Shutdown();
                 });
             };
 
-            // On load, connect and setup
+            // On load, connect (quietly retry) and let Tracker push state on connect
             Loaded += async (_, __) =>
             {
-                var settings = AppSettings.Load();
-                _baseFolder = settings.BaseFolder;
-                IntervalBox.Text = settings.IntervalSeconds.ToString();
-                QualityBox.Text = settings.JpegQuality.ToString();
                 RefreshDaySelector();
                 SetupWatcherForToday();
 
-                try
+                var connected = await TryConnectWithRetriesAsync(
+                    totalTimeout: TimeSpan.FromSeconds(10),
+                    attemptDelay: TimeSpan.FromMilliseconds(500));
+
+                if (connected)
                 {
-                    await _pipeClient.ConnectAsync(TimeSpan.FromSeconds(3), _cts.Token);
-                    if (_pipeClient.IsConnected)
-                    {
-                        SetControlsEnabled(true);
-
-                        // Ask tracker for current settings/state
-                        await _pipeClient.SendAsync(new PipeMessage { Command = "QueryState" }, _cts.Token);
-
-                        // Tell tracker our folder if valid
-                        if (Directory.Exists(_baseFolder))
-                        {
-                            await _pipeClient.SendAsync(new PipeMessage { Command = "SetFolder", Path = _baseFolder }, _cts.Token);
-                        }
-                    }
-                    else
-                    {
-                        System.Windows.MessageBox.Show("Failed to connect to ScreenshotTracker.");
-                    }
+                    SetControlsEnabled(true);
+                    // Do NOT send anything here. Tracker will push SettingsSync + CaptureState on connect.
                 }
-                catch (Exception ex)
+                else
                 {
-                    System.Windows.MessageBox.Show($"Pipe connection failed: {ex.Message}");
+                    // Leave UI disabled; user can start Tracker and re-open Client.
                 }
             };
 
+            // Dispose pipe on unload
             Unloaded += async (_, __) =>
             {
                 try { _cts.Cancel(); } catch { /* ignore */ }
                 await _pipeClient.DisposeAsync();
             };
 
-            // Day selector change → load newest image & watch folder
+            // Ensure clean async dispose on window close (no UI-thread blocking)
+            this.Closing += MainWindow_Closing;
+
+            // Day selector change → load newest image & watch that folder
             DaySelector.SelectionChanged += (_, __) =>
             {
                 try
@@ -124,6 +110,16 @@ namespace ScreenshotClient
             };
         }
 
+        private async void MainWindow_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
+        {
+            try
+            {
+                _cts.Cancel();
+                await _pipeClient.DisposeAsync();
+            }
+            catch { /* ignore on close */ }
+        }
+
         private async Task SendCommandAsync(string command, string? value = null, string? path = null)
         {
             if (!_pipeClient.IsConnected)
@@ -134,23 +130,39 @@ namespace ScreenshotClient
             await _pipeClient.SendAsync(new PipeMessage { Command = command, Value = value, Path = path }, _cts.Token);
         }
 
+        private async Task<bool> TryConnectWithRetriesAsync(TimeSpan totalTimeout, TimeSpan attemptDelay)
+        {
+            var deadline = DateTime.UtcNow + totalTimeout;
+
+            while (DateTime.UtcNow < deadline)
+            {
+                try
+                {
+                    await _pipeClient.ConnectAsync(TimeSpan.FromSeconds(2), _cts.Token);
+                    if (_pipeClient.IsConnected)
+                        return true;
+                }
+                catch
+                {
+                    // ignore and retry
+                }
+
+                await Task.Delay(attemptDelay);
+            }
+
+            return false;
+        }
+
         private async void FolderBtn_Click(object? sender, RoutedEventArgs e)
         {
             var dlg = new System.Windows.Forms.FolderBrowserDialog();
             var result = dlg.ShowDialog();
             if (result == System.Windows.Forms.DialogResult.OK && Directory.Exists(dlg.SelectedPath))
             {
-                _baseFolder = dlg.SelectedPath;
-
-                var s = AppSettings.Load();
-                s.BaseFolder = _baseFolder;
-                s.Save();
-
-                RefreshDaySelector();
-                SetupWatcherForToday();
-
-                if (_pipeClient.IsConnected)
-                    await _pipeClient.SendAsync(new PipeMessage { Command = "SetFolder", Path = _baseFolder }, _cts.Token);
+                // Client does NOT persist — send to Tracker (source of truth)
+                var chosen = dlg.SelectedPath;
+                await SendCommandAsync("SetFolder", path: chosen);
+                // We’ll get SettingsSync back and update UI then.
             }
         }
 
@@ -161,7 +173,7 @@ namespace ScreenshotClient
                 switch (msg.Event)
                 {
                     case "SettingsSync":
-                        // Value: "interval;jpeg", Path: BaseFolder
+                        // Value: "interval;jpeg", Path: BaseFolder (authoritative from Tracker)
                         if (!string.IsNullOrEmpty(msg.Value))
                         {
                             var parts = msg.Value.Split(';');
@@ -192,7 +204,6 @@ namespace ScreenshotClient
                         break;
 
                     case "CaptureState":
-                        // "Running" | "Stopped"
                         _isCapturing = string.Equals(msg.Value, "Running", StringComparison.OrdinalIgnoreCase);
                         UpdateServiceVisuals(_isCapturing);
                         break;
@@ -204,48 +215,45 @@ namespace ScreenshotClient
                             EnsureDayInSelector(Path.GetDirectoryName(msg.Path!) ?? "");
                         }
                         break;
+
+                    case "TrackerExiting":
+                        // Close the client immediately when the tracker exits
+                        System.Windows.Application.Current.Shutdown();
+                        break;
                 }
             });
         }
 
         private void SetControlsEnabled(bool enabled)
         {
-            // Status "button" stays enabled so colors show; it's non-clickable via IsHitTestVisible.
-            // StartBtn.IsEnabled = true; // not needed, but fine if you want to set explicitly
-
+            // Status display remains enabled (non-clickable via XAML)
             PauseBtn.IsEnabled = enabled;
             FolderBtn.IsEnabled = enabled;
             IntervalBox.IsEnabled = enabled;
             QualityBox.IsEnabled = enabled;
         }
 
-        /// <summary>
-        /// Top display shows status (green/red). Bottom toggle shows Start/Stop label.
-        /// </summary>
+        /// <summary>Top display shows status (green/red). Bottom toggle shows Start/Stop label.</summary>
         private void UpdateServiceVisuals(bool isCapturing)
         {
             _isCapturing = isCapturing;
 
             if (isCapturing)
             {
-                // Status display
                 StartBtn.Content = "Service is Running";
                 StartBtn.Background = System.Windows.Media.Brushes.Green;
                 StartBtn.Foreground = System.Windows.Media.Brushes.White;
 
-                // Toggle label
                 PauseBtn.Content = "Stop service";
                 PauseBtn.Background = System.Windows.Media.Brushes.LightGray;
                 PauseBtn.Foreground = System.Windows.Media.Brushes.Black;
             }
             else
             {
-                // Status display
                 StartBtn.Content = "Service is Stopped";
                 StartBtn.Background = System.Windows.Media.Brushes.Red;
                 StartBtn.Foreground = System.Windows.Media.Brushes.White;
 
-                // Toggle label
                 PauseBtn.Content = "Start service";
                 PauseBtn.Background = System.Windows.Media.Brushes.LightGray;
                 PauseBtn.Foreground = System.Windows.Media.Brushes.Black;
