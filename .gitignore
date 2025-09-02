@@ -39,3 +39,4 @@ coverage/
 *.coverage
 *.coveragexml
 *.log
+Build-Reference_adv.ps1
