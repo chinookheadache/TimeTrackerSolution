@@ -22,8 +22,7 @@ namespace ScreenshotTracker
             base.OnStartup(e);
 
             // --- Single-instance guard ---
-            bool createdNew;
-            _singleInstanceMutex = new Mutex(initiallyOwned: true, name: @"Local\TimeTrackerSolution.ScreenshotTracker", out createdNew);
+            _singleInstanceMutex = new Mutex(initiallyOwned: true, name: @"Local\TimeTrackerSolution.ScreenshotTracker", out bool createdNew);
             if (!createdNew)
             {
                 // Another instance is already running.

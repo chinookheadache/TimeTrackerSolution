@@ -1,5 +1,6 @@
 // ScreenshotShared/Messaging/PipeClient.cs
 using System;
+using System.IO;
 using System.IO.Pipes;
 using System.Threading;
 using System.Threading.Tasks;
@@ -51,8 +52,24 @@ namespace ScreenshotShared.Messaging
 
         public async Task SendAsync(PipeMessage message, CancellationToken cancellationToken = default)
         {
-            if (_pipe is null || !_pipe.IsConnected) throw new InvalidOperationException("PipeClient not connected.");
-            await PipeFramer.WriteAsync(_pipe, PipeMessage.Serialize(message), cancellationToken).ConfigureAwait(false);
+            if (_pipe is null || !_pipe.IsConnected)
+                throw new InvalidOperationException("PipeClient not connected.");
+
+            try
+            {
+                await PipeFramer.WriteAsync(_pipe, PipeMessage.Serialize(message), cancellationToken).ConfigureAwait(false);
+            }
+            catch (IOException ioex)
+            {
+                // Treat as a remote disconnect: surface and let UI close gracefully
+                ReceiveFaulted?.Invoke(ioex);
+                throw new InvalidOperationException("PipeClient write failed (broken pipe).", ioex);
+            }
+            catch (ObjectDisposedException odex)
+            {
+                ReceiveFaulted?.Invoke(odex);
+                throw new InvalidOperationException("PipeClient write failed (disposed).", odex);
+            }
         }
 
         public async ValueTask DisposeAsync()

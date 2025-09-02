@@ -2,7 +2,7 @@
 bin/
 obj/
 [Bb]uild/
-[Ll]og*/
+logs/             # only ignore folders literally named "logs"
 TestResults/
 
 # VS / Rider / tooling
@@ -39,4 +39,3 @@ coverage/
 *.coverage
 *.coveragexml
 *.log
-
