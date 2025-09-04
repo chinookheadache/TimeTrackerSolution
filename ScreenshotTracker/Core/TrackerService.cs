@@ -1,4 +1,5 @@
-﻿using System;
+﻿// ScreenshotTracker/Core/TrackerService.cs
+using System;
 using System.Collections.Concurrent;
 using System.IO;
 using System.Linq;
@@ -6,6 +7,7 @@ using System.Threading.Tasks;
 using ScreenshotShared.Logging;
 using ScreenshotShared.Messaging;
 using ScreenshotShared.Settings;
+using ScreenshotShared.Utilities;
 
 namespace ScreenshotTracker.Core
 {
@@ -13,55 +15,53 @@ namespace ScreenshotTracker.Core
     {
         private readonly PipeServer _server;
         private readonly ScreenshotCollector _collector;
-
-        // Single source of truth for settings
         private readonly AppSettings _settings;
-
-        // Track connected client ids so we can broadcast
         private readonly ConcurrentDictionary<int, byte> _clients = new();
+
+        private const string AppRunName = "TimeTrackerSolution";
 
         public TrackerService(string pipeName = "ScreenshotPipe")
         {
+            _settings = AppSettings.Load();
+            EnsureFolderExists(_settings.BaseFolder);
+
+            // Apply autorun state best-effort at startup
             try
             {
-                // Load persisted settings once at startup
-                _settings = AppSettings.Load();
-                EnsureFolderExists(_settings.BaseFolder);
-
-                // ScreenshotCollector(Func<string>, Func<int>, Func<int>) — pass delegates POSITIONALLY
-                _collector = new ScreenshotCollector(
-                    () => _settings.BaseFolder,
-                    () => _settings.IntervalSeconds,
-                    () => _settings.JpegQuality
-                );
-
-                // EventHandler<string> → (sender, path)
-                _collector.ScreenshotSaved += (sender, path) =>
-                {
-                    try
-                    {
-                        if (!string.IsNullOrWhiteSpace(path))
-                        {
-                            Logger.LogInfo($"Screenshot saved: {path}");
-                            Broadcast(new PipeMessage { Event = "ScreenshotSaved", Path = path });
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.LogError(ex, "Failed to broadcast ScreenshotSaved");
-                    }
-                };
-
-                _server = new PipeServer(pipeName);
-                _server.ClientConnected += OnClientConnected;         // Action<int>
-                _server.ClientDisconnected += OnClientDisconnected;   // Action<int>
-                _server.MessageReceived += OnMessageReceived;         // Action<int, PipeMessage>
+                var exe = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName ?? "";
+                AutoRun.Set(AppRunName, exe, _settings.StartWithWindows);
             }
             catch (Exception ex)
             {
-                Logger.LogError(ex, "TrackerService ctor failed");
-                throw;
+                Logger.LogError(ex, "Applying StartWithWindows on startup");
             }
+
+            _collector = new ScreenshotCollector(
+                () => _settings.BaseFolder,
+                () => _settings.IntervalSeconds,
+                () => _settings.JpegQuality
+            );
+
+            _collector.ScreenshotSaved += (sender, path) =>
+            {
+                try
+                {
+                    if (!string.IsNullOrWhiteSpace(path))
+                    {
+                        Logger.LogInfo($"Screenshot saved: {path}");
+                        Broadcast(new PipeMessage { Event = "ScreenshotSaved", Path = path });
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogError(ex, "Broadcast ScreenshotSaved failed");
+                }
+            };
+
+            _server = new PipeServer(pipeName);
+            _server.ClientConnected += OnClientConnected;
+            _server.ClientDisconnected += OnClientDisconnected;
+            _server.MessageReceived += OnMessageReceived;
         }
 
         public void Start()
@@ -70,6 +70,13 @@ namespace ScreenshotTracker.Core
             {
                 _server.Start();
                 Logger.LogInfo("PipeServer started.");
+
+                // Honor auto-start capture flag
+                if (_settings.AutoStartCapture && !_collector.IsRunning)
+                {
+                    _collector.Start();
+                    Logger.LogInfo("AutoStartCapture → started.");
+                }
             }
             catch (Exception ex)
             {
@@ -78,20 +85,14 @@ namespace ScreenshotTracker.Core
             }
         }
 
-        /// <summary>
-        /// Called by App on tray "Exit": tells clients to shutdown, stops capture, then we can dispose.
-        /// </summary>
         public async Task RequestShutdownAsync()
         {
             try
             {
                 Logger.LogInfo("RequestShutdownAsync: broadcasting TrackerExiting…");
                 await BroadcastAsync(new PipeMessage { Event = "TrackerExiting" });
-
-                // Give clients a brief moment to process
                 await Task.Delay(200);
 
-                // Stop capture if running
                 if (_collector.IsRunning)
                 {
                     Logger.LogInfo("Stopping capture on shutdown.");
@@ -126,13 +127,12 @@ namespace ScreenshotTracker.Core
 
             try
             {
-                // Proactively send current settings and capture state
                 SendSettingsSync(clientId);
                 SendCaptureState(clientId);
             }
             catch (Exception ex)
             {
-                Logger.LogError(ex, $"Error syncing state to client {clientId}");
+                Logger.LogError(ex, $"Sync to client {clientId} failed");
             }
         }
 
@@ -146,109 +146,116 @@ namespace ScreenshotTracker.Core
         {
             try
             {
-                if (!string.IsNullOrWhiteSpace(msg.Command))
+                if (string.IsNullOrWhiteSpace(msg?.Command))
+                    return;
+
+                Logger.LogInfo($"Command from {clientId}: {msg.Command} (Value='{msg.Value}', Path='{msg.Path}')");
+
+                switch (msg.Command)
                 {
-                    Logger.LogInfo($"Command from {clientId}: {msg.Command} (Value='{msg.Value}', Path='{msg.Path}')");
+                    case "QueryState":
+                        SendSettingsSync(clientId);
+                        SendCaptureState(clientId);
+                        break;
 
-                    switch (msg.Command)
-                    {
-                        case "QueryState":
-                            SendSettingsSync(clientId);
-                            SendCaptureState(clientId);
-                            break;
+                    case "StartCapture":
+                        if (!_collector.IsRunning)
+                        {
+                            _collector.Start();
+                            await BroadcastAsync(new PipeMessage { Event = "CaptureStarted" });
+                            SendCaptureStateAll();
+                            Logger.LogInfo("Capture started.");
+                        }
+                        break;
 
-                        case "StartCapture":
-                            if (!_collector.IsRunning)
-                            {
-                                _collector.Start();
-                                await BroadcastAsync(new PipeMessage { Event = "CaptureStarted" });
-                                SendCaptureStateAll();
-                                Logger.LogInfo("Capture started.");
-                            }
-                            break;
+                    case "StopCapture":
+                        if (_collector.IsRunning)
+                        {
+                            _collector.Stop();
+                            await BroadcastAsync(new PipeMessage { Event = "CaptureStopped" });
+                            SendCaptureStateAll();
+                            Logger.LogInfo("Capture stopped.");
+                        }
+                        break;
 
-                        case "StopCapture":
-                            if (_collector.IsRunning)
-                            {
-                                _collector.Stop();
-                                await BroadcastAsync(new PipeMessage { Event = "CaptureStopped" });
-                                SendCaptureStateAll();
-                                Logger.LogInfo("Capture stopped.");
-                            }
-                            break;
+                    case "SetInterval":
+                        if (int.TryParse(msg.Value, out var seconds) && seconds > 0)
+                        {
+                            _settings.IntervalSeconds = seconds;
+                            _settings.Save();
+                            Logger.LogInfo($"Interval → {seconds}s");
+                            BroadcastSettingsSync();
+                        }
+                        break;
 
-                        case "SetInterval":
-                            if (int.TryParse(msg.Value, out var seconds) && seconds > 0)
-                            {
-                                _settings.IntervalSeconds = seconds;
-                                _settings.Save();
-                                Logger.LogInfo($"Interval updated to {seconds}s");
-                                BroadcastSettingsSync();
-                            }
-                            break;
+                    case "SetQuality":
+                        if (int.TryParse(msg.Value, out var quality) && quality is >= 1 and <= 100)
+                        {
+                            _settings.JpegQuality = quality;
+                            _settings.Save();
+                            Logger.LogInfo($"JPEG quality → {quality}%");
+                            BroadcastSettingsSync();
+                        }
+                        break;
 
-                        case "SetQuality":
-                            if (int.TryParse(msg.Value, out var quality) && quality is >= 1 and <= 100)
-                            {
-                                _settings.JpegQuality = quality;
-                                _settings.Save();
-                                Logger.LogInfo($"JPEG quality updated to {quality}%");
-                                BroadcastSettingsSync();
-                            }
-                            break;
+                    case "SetFolder":
+                        if (!string.IsNullOrWhiteSpace(msg.Path))
+                        {
+                            _settings.BaseFolder = msg.Path!;
+                            EnsureFolderExists(_settings.BaseFolder);
+                            _settings.Save();
+                            Logger.LogInfo($"Base folder → '{_settings.BaseFolder}'");
+                            BroadcastSettingsSync();
+                        }
+                        break;
 
-                        case "SetFolder":
-                            if (!string.IsNullOrWhiteSpace(msg.Path))
-                            {
-                                _settings.BaseFolder = msg.Path!;
-                                EnsureFolderExists(_settings.BaseFolder);
-                                _settings.Save();
-                                Logger.LogInfo($"Base folder changed to '{_settings.BaseFolder}'");
-                                BroadcastSettingsSync();
-                            }
-                            break;
-                    }
+                    // These are for when we later add client UI; tray also calls the public methods below.
+                    case "SetStartWithWindows":
+                        {
+                            var enable = string.Equals(msg.Value, "true", StringComparison.OrdinalIgnoreCase);
+                            SetStartWithWindows(enable);
+                        }
+                        break;
+
+                    case "SetAutoStartCapture":
+                        {
+                            var enable = string.Equals(msg.Value, "true", StringComparison.OrdinalIgnoreCase);
+                            await SetAutoStartCaptureAsync(enable);
+                        }
+                        break;
                 }
             }
             catch (Exception ex)
             {
-                Logger.LogError(ex, "Error in OnMessageReceived");
+                Logger.LogError(ex, "OnMessageReceived failed");
             }
         }
 
-        // -------------------- Helpers: Settings & State sync --------------------
+        // -------------------- Helpers --------------------
 
         private static void EnsureFolderExists(string? folder)
         {
-            if (!string.IsNullOrWhiteSpace(folder))
-            {
-                try
-                {
-                    Directory.CreateDirectory(folder!);
-                }
-                catch (Exception ex)
-                {
-                    Logger.LogError(ex, $"Failed to create base folder '{folder}'");
-                }
-            }
+            if (string.IsNullOrWhiteSpace(folder)) return;
+            try { Directory.CreateDirectory(folder!); }
+            catch (Exception ex) { Logger.LogError(ex, $"Create base folder '{folder}' failed"); }
         }
 
         private void SendSettingsSync(int clientId)
         {
             try
             {
-                var payload = $"{_settings.IntervalSeconds};{_settings.JpegQuality}";
-                var msg = new PipeMessage
-                {
-                    Event = "SettingsSync",
-                    Value = payload,
-                    Path = _settings.BaseFolder
-                };
+                var msg = PipeMessage.SettingsSync(
+                    _settings.BaseFolder,
+                    _settings.IntervalSeconds,
+                    _settings.JpegQuality,
+                    _settings.StartWithWindows,
+                    _settings.AutoStartCapture);
+
                 _ = _server.SendAsync(clientId, msg);
             }
             catch (Exception ex)
             {
-                Logger.LogError(ex, $"Failed to send SettingsSync to client {clientId}");
+                Logger.LogError(ex, $"SendSettingsSync → client {clientId} failed");
             }
         }
 
@@ -256,17 +263,18 @@ namespace ScreenshotTracker.Core
         {
             try
             {
-                var payload = $"{_settings.IntervalSeconds};{_settings.JpegQuality}";
-                Broadcast(new PipeMessage
-                {
-                    Event = "SettingsSync",
-                    Value = payload,
-                    Path = _settings.BaseFolder
-                });
+                var msg = PipeMessage.SettingsSync(
+                    _settings.BaseFolder,
+                    _settings.IntervalSeconds,
+                    _settings.JpegQuality,
+                    _settings.StartWithWindows,
+                    _settings.AutoStartCapture);
+
+                Broadcast(msg);
             }
             catch (Exception ex)
             {
-                Logger.LogError(ex, "Failed to broadcast SettingsSync");
+                Logger.LogError(ex, "BroadcastSettingsSync failed");
             }
         }
 
@@ -279,7 +287,7 @@ namespace ScreenshotTracker.Core
             }
             catch (Exception ex)
             {
-                Logger.LogError(ex, $"Failed to send CaptureState to client {clientId}");
+                Logger.LogError(ex, $"SendCaptureState → client {clientId} failed");
             }
         }
 
@@ -292,7 +300,7 @@ namespace ScreenshotTracker.Core
             }
             catch (Exception ex)
             {
-                Logger.LogError(ex, "Failed to broadcast CaptureState");
+                Logger.LogError(ex, "SendCaptureStateAll failed");
             }
         }
 
@@ -300,14 +308,8 @@ namespace ScreenshotTracker.Core
         {
             foreach (var id in _clients.Keys.ToArray())
             {
-                try
-                {
-                    _ = _server.SendAsync(id, msg);
-                }
-                catch (Exception ex)
-                {
-                    Logger.LogError(ex, $"Broadcast send failed to client {id}");
-                }
+                try { _ = _server.SendAsync(id, msg); }
+                catch (Exception ex) { Logger.LogError(ex, $"Broadcast → client {id} failed"); }
             }
         }
 
@@ -315,15 +317,45 @@ namespace ScreenshotTracker.Core
         {
             foreach (var id in _clients.Keys.ToArray())
             {
-                try
-                {
-                    await _server.SendAsync(id, msg);
-                }
-                catch (Exception ex)
-                {
-                    Logger.LogError(ex, $"BroadcastAsync send failed to client {id}");
-                }
+                try { await _server.SendAsync(id, msg); }
+                catch (Exception ex) { Logger.LogError(ex, $"BroadcastAsync → client {id} failed"); }
             }
+        }
+
+        // --------- Public API used by tray ----------
+
+        public bool GetStartWithWindows() => _settings.StartWithWindows;
+        public bool GetAutoStartCapture() => _settings.AutoStartCapture;
+
+        public void SetStartWithWindows(bool enabled)
+        {
+            _settings.StartWithWindows = enabled;
+            _settings.Save();
+            try
+            {
+                var exe = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName ?? "";
+                AutoRun.Set(AppRunName, exe, enabled);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "SetStartWithWindows: apply autorun failed");
+            }
+            BroadcastSettingsSync();
+        }
+
+        public async Task SetAutoStartCaptureAsync(bool enabled)
+        {
+            _settings.AutoStartCapture = enabled;
+            _settings.Save();
+
+            if (enabled && !_collector.IsRunning)
+            {
+                _collector.Start();
+                await BroadcastAsync(new PipeMessage { Event = "CaptureStarted" });
+                SendCaptureStateAll();
+            }
+
+            BroadcastSettingsSync();
         }
     }
 }

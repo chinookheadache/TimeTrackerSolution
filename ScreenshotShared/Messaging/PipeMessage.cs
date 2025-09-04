@@ -7,29 +7,45 @@ namespace ScreenshotShared.Messaging
 {
     public sealed class PipeMessage
     {
-        [JsonPropertyName("Command")] public string? Command { get; init; }
-        [JsonPropertyName("Event")]   public string? Event { get; init; }
-        [JsonPropertyName("Value")]   public string? Value { get; init; }
-        [JsonPropertyName("Path")]    public string? Path { get; init; }
+        public string? Command { get; set; }
+        public string? Event { get; set; }
 
-        [JsonPropertyName("Version")]       public string Version { get; init; } = "1.0";
-        [JsonPropertyName("CorrelationId")] public string CorrelationId { get; init; } = Guid.NewGuid().ToString("N");
-        [JsonPropertyName("TimestampUtc")]  public DateTime TimestampUtc { get; init; } = DateTime.UtcNow;
+        public string? Value { get; set; }
+        public string? Path { get; set; }
 
-        public static readonly JsonSerializerOptions JsonOptions = new()
+        // NEW: explicit flags included in SettingsSync (Client can ignore for now)
+        public bool? StartWithWindows { get; set; }
+        public bool? AutoStartCapture { get; set; }
+
+        public string Version { get; set; } = "1.0";
+        public DateTime TimestampUtc { get; set; } = DateTime.UtcNow;
+
+        private static readonly JsonSerializerOptions _json = new()
         {
-            PropertyNamingPolicy = null,
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
             DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
             WriteIndented = false
         };
 
-        public static string Serialize(PipeMessage msg) => JsonSerializer.Serialize(msg, JsonOptions);
-        public static PipeMessage? Deserialize(string json) => JsonSerializer.Deserialize<PipeMessage>(json, JsonOptions);
+        public static string Serialize(PipeMessage msg) => JsonSerializer.Serialize(msg, _json);
+        public static PipeMessage? Deserialize(string json)
+        {
+            try { return JsonSerializer.Deserialize<PipeMessage>(json, _json); }
+            catch { return null; }
+        }
 
-        public static PipeMessage Cmd(string name, string? value = null, string? path = null, string? correlationId = null) =>
-            new() { Command = name, Value = value, Path = path, CorrelationId = correlationId ?? Guid.NewGuid().ToString("N"), TimestampUtc = DateTime.UtcNow };
+        // Helpers
+        public static PipeMessage Cmd(string command, string? value = null, string? path = null) =>
+            new PipeMessage { Command = command, Value = value, Path = path };
 
-        public static PipeMessage Ev(string name, string? value = null, string? path = null, string? correlationId = null) =>
-            new() { Event = name, Value = value, Path = path, CorrelationId = correlationId ?? Guid.NewGuid().ToString("N"), TimestampUtc = DateTime.UtcNow };
+        public static PipeMessage SettingsSync(string baseFolder, int interval, int quality, bool startWithWindows, bool autoStartCapture)
+            => new PipeMessage
+            {
+                Event = "SettingsSync",
+                Path = baseFolder,
+                Value = $"{interval};{quality}",
+                StartWithWindows = startWithWindows,
+                AutoStartCapture = autoStartCapture
+            };
     }
 }

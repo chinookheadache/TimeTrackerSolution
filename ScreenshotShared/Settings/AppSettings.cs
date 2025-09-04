@@ -2,22 +2,33 @@
 using System;
 using System.IO;
 using System.Text.Json;
+using ScreenshotShared.Logging;
 
 namespace ScreenshotShared.Settings
 {
     public sealed class AppSettings
     {
         public string BaseFolder { get; set; } = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "TimeTrackerSolution", "Screenshots");
+            Environment.GetFolderPath(Environment.SpecialFolder.MyPictures),
+            "Screenshots");
 
         public int IntervalSeconds { get; set; } = 30;
         public int JpegQuality { get; set; } = 80;
 
-        public static string SettingsDir => Path.Combine(
+        // NEW flags (Step 7)
+        public bool StartWithWindows { get; set; } = false;
+        public bool AutoStartCapture { get; set; } = false;
+
+        private static readonly JsonSerializerOptions _json = new()
+        {
+            WriteIndented = true
+        };
+
+        private static string SettingsDir => Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
             "TimeTrackerSolution");
-        public static string SettingsPath => Path.Combine(SettingsDir, "settings.json");
+
+        private static string SettingsPath => Path.Combine(SettingsDir, "settings.json");
 
         public static AppSettings Load()
         {
@@ -27,22 +38,33 @@ namespace ScreenshotShared.Settings
                 if (File.Exists(SettingsPath))
                 {
                     var json = File.ReadAllText(SettingsPath);
-                    return JsonSerializer.Deserialize<AppSettings>(json) ?? new();
+                    var s = JsonSerializer.Deserialize<AppSettings>(json, _json);
+                    if (s is not null) return s;
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "AppSettings.Load failed");
+            }
+
             return new AppSettings();
         }
-        private static readonly JsonSerializerOptions s_optsIndented = new() { WriteIndented = true };
+
         public void Save()
         {
             try
             {
                 Directory.CreateDirectory(SettingsDir);
-                var json = JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
-                File.WriteAllText(SettingsPath, json);
+                var tmp = SettingsPath + ".tmp";
+                var json = JsonSerializer.Serialize(this, _json);
+                File.WriteAllText(tmp, json);
+                if (File.Exists(SettingsPath)) File.Delete(SettingsPath);
+                File.Move(tmp, SettingsPath);
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "AppSettings.Save failed");
+            }
         }
     }
 }

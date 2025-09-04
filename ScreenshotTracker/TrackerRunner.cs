@@ -1,135 +1,130 @@
-﻿using System;
-using System.Diagnostics;
-using System.IO;
-using System.Reflection;
+﻿// ScreenshotTracker/TrackerRunner.cs
+using System;
+using System.Drawing;
 using System.Threading.Tasks;
-using System.Windows;                      // WPF Application
-using WinForms = System.Windows.Forms;     // alias to avoid ambiguity
+using System.Windows;
+using System.Windows.Forms;
+using ScreenshotShared.Logging;
+using ScreenshotTracker.Core;
 
 namespace ScreenshotTracker
 {
     /// <summary>
-    /// Hosts the system tray icon and context menu for the Tracker.
-    /// Call TrackerRunner.Initialize() once at startup, and Dispose() on exit.
+    /// Manages the NotifyIcon tray UI and routes actions to TrackerService.
     /// </summary>
     public sealed class TrackerRunner : IDisposable
     {
-        private readonly WinForms.NotifyIcon _tray;
-        private readonly WinForms.ContextMenuStrip _menu;
-        private readonly WinForms.ToolStripMenuItem _openClientItem;
-        private readonly WinForms.ToolStripMenuItem _exitItem;
+        private readonly TrackerService _service;
+        private readonly NotifyIcon _tray;
+        private readonly ToolStripMenuItem _openClientItem;
+        private readonly ToolStripMenuItem _startWithWindowsItem;
+        private readonly ToolStripMenuItem _autoStartCaptureItem;
+        private readonly ToolStripMenuItem _exitItem;
 
-        private bool _disposed;
-
-        private TrackerRunner()
+        public TrackerRunner(TrackerService service)
         {
-            // Build menu
-            _menu = new WinForms.ContextMenuStrip();
+            _service = service ?? throw new ArgumentNullException(nameof(service));
 
-            _openClientItem = new WinForms.ToolStripMenuItem("Open Client");
-            _openClientItem.Click += async (_, __) => await OpenClientAsync();
-
-            _exitItem = new WinForms.ToolStripMenuItem("Exit");
-            _exitItem.Click += async (_, __) => await ExitFromTrayAsync();
-
-            _menu.Items.Add(_openClientItem);
-            _menu.Items.Add(new WinForms.ToolStripSeparator());
-            _menu.Items.Add(_exitItem);
-
-            // Create tray icon
-            _tray = new WinForms.NotifyIcon
+            _tray = new NotifyIcon
             {
-                Text = "PVI Time Tracker – Tracker",
+                Text = "TimeTrackerSolution",
+                Icon = SystemIcons.Application,
                 Visible = true,
-                ContextMenuStrip = _menu
+                ContextMenuStrip = new ContextMenuStrip()
             };
 
-            // Try to load an icon. Falls back to a system icon if not found.
-            try
-            {
-                var exeDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) ?? "";
-                var icoPath = Path.Combine(exeDir, "AppIcon.ico");
-                if (File.Exists(icoPath))
-                {
-                    _tray.Icon = new System.Drawing.Icon(icoPath);
-                }
-                else
-                {
-                    _tray.Icon = System.Drawing.SystemIcons.Application;
-                }
-            }
-            catch
-            {
-                _tray.Icon = System.Drawing.SystemIcons.Application;
-            }
+            _openClientItem = new ToolStripMenuItem("Open Client");
+            _openClientItem.Click += (_, __) => LaunchClient();
 
-            // Double-click tray to open client
-            _tray.DoubleClick += async (_, __) => await OpenClientAsync();
+            _tray.ContextMenuStrip.Items.Add(_openClientItem);
+            _tray.ContextMenuStrip.Items.Add(new ToolStripSeparator());
+
+            // Step 7 toggles
+            _startWithWindowsItem = new ToolStripMenuItem("Start with Windows")
+            {
+                CheckOnClick = true,
+                Checked = _service.GetStartWithWindows()
+            };
+            _startWithWindowsItem.Click += (_, __) =>
+            {
+                try
+                {
+                    var desired = _startWithWindowsItem.Checked;
+                    _service.SetStartWithWindows(desired);
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogError(ex, "Toggle Start with Windows failed");
+                    _startWithWindowsItem.Checked = _service.GetStartWithWindows();
+                }
+            };
+
+            _autoStartCaptureItem = new ToolStripMenuItem("Auto-start capture")
+            {
+                CheckOnClick = true,
+                Checked = _service.GetAutoStartCapture()
+            };
+            _autoStartCaptureItem.Click += async (_, __) =>
+            {
+                try
+                {
+                    var desired = _autoStartCaptureItem.Checked;
+                    await _service.SetAutoStartCaptureAsync(desired);
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogError(ex, "Toggle Auto-start capture failed");
+                    _autoStartCaptureItem.Checked = _service.GetAutoStartCapture();
+                }
+            };
+
+            _tray.ContextMenuStrip.Items.Add(_startWithWindowsItem);
+            _tray.ContextMenuStrip.Items.Add(_autoStartCaptureItem);
+            _tray.ContextMenuStrip.Items.Add(new ToolStripSeparator());
+
+            _exitItem = new ToolStripMenuItem("Exit");
+            _exitItem.Click += async (_, __) =>
+            {
+                try
+                {
+                    await _service.RequestShutdownAsync();
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogError(ex, "RequestShutdown from tray failed");
+                }
+                finally
+                {
+                    try { System.Windows.Application.Current.Shutdown(); } catch { }
+                }
+            };
+            _tray.ContextMenuStrip.Items.Add(_exitItem);
         }
 
-        /// <summary>Call once from App.OnStartup.</summary>
-        public static TrackerRunner Initialize() => new TrackerRunner();
-
-        /// <summary>
-        /// Launch the ScreenshotClient.exe located alongside the Tracker (packaged).
-        /// </summary>
-        private static Task OpenClientAsync()
+        private void LaunchClient()
         {
             try
             {
-                var exeDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) ?? "";
-                var clientPath = Path.Combine(exeDir, "ScreenshotClient.exe");
-                if (File.Exists(clientPath))
+                var exe = "ScreenshotClient.exe";
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
                 {
-                    Process.Start(new ProcessStartInfo
-                    {
-                        FileName = clientPath,
-                        WorkingDirectory = exeDir,
-                        UseShellExecute = true
-                    });
-                    return Task.CompletedTask;
-                }
-
-                WinForms.MessageBox.Show(
-                    "Could not find ScreenshotClient.exe next to the Tracker.",
-                    "Open Client",
-                    WinForms.MessageBoxButtons.OK,
-                    WinForms.MessageBoxIcon.Information);
+                    FileName = exe,
+                    UseShellExecute = true,
+                    WorkingDirectory = AppDomain.CurrentDomain.BaseDirectory
+                });
             }
             catch (Exception ex)
             {
-                WinForms.MessageBox.Show(
-                    $"Failed to launch client:\n{ex.Message}",
-                    "Open Client",
-                    WinForms.MessageBoxButtons.OK,
-                    WinForms.MessageBoxIcon.Error);
-            }
-            return Task.CompletedTask;
-        }
-
-        /// <summary>
-        /// Coordinated shutdown: broadcast TrackerExiting via App.ExitFromTrayAsync(), then close app.
-        /// </summary>
-        private static async Task ExitFromTrayAsync()
-        {
-            if (System.Windows.Application.Current is App app)
-            {
-                await app.ExitFromTrayAsync();
-            }
-            else
-            {
-                System.Windows.Application.Current?.Dispatcher.Invoke(System.Windows.Application.Current.Shutdown);
+                Logger.LogError(ex, "Failed to launch client", "tracker");
+                System.Windows.MessageBox.Show("Failed to launch client.", "TimeTrackerSolution",
+                    MessageBoxButton.OK, MessageBoxImage.Error);
             }
         }
 
         public void Dispose()
         {
-            if (_disposed) return;
-            _disposed = true;
-
             try { _tray.Visible = false; } catch { }
             try { _tray.Dispose(); } catch { }
-            try { _menu.Dispose(); } catch { }
         }
     }
 }
